@@ -1,0 +1,180 @@
+---
+title: "Practical Machine Learning Project"
+author: Konstantin Zakharov
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+This project utilizes machine learning algorithms to predict the manner in which the 6 participants of the study performed the exercise, based on observations collected from accelerometers placed on the belt, forearm, arm, and dumbbell of the participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har
+
+# Summary
+This project explored three different models: Random Forests, Classification and Regression Trees (CART), and the Gradient Boosting Machine (GBM) model. To get a more reliable and unbiased estimate of a machine learning model’s performance on unseen (test) data, the project employed the cross-validation technique of k-fold. Comparing the accuracy of 3 models, the final model is the Random Forest with the best accuracy of 99.46%, which was used for the final refit and for predicting on the test data.
+
+# Data Loading and Preparation
+First, let's load the source data and prepare the training dataset. After removing irrelevant data the training dataset consists of 19622 observations for 53 variables.
+```{r}
+library(caret)
+library(dplyr)
+
+library(lattice)
+library(rattle)
+
+set.seed(1234)
+
+# read data
+training_df <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"),header=TRUE)
+testing_df <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"),header=TRUE)
+
+df <- training_df %>%
+  # order by time within subjects
+  arrange(user_name, raw_timestamp_part_1, raw_timestamp_part_2) %>%
+  # as a factor
+  mutate(classe = factor(classe)) %>%
+  # remove metadata
+  select(-c(1:7)) %>%
+  # remove non-numeric, if present
+  select(classe, where(is.numeric)) 
+
+na_rate <- sapply(df, function(x) mean(is.na(x)))
+# drop the columns, where almost all values are NA, but keep the "classe" variable
+df <- df[, na_rate < 0.95 | names(na_rate) %in% "classe"]
+
+summary(df)
+```
+## Data slicing
+To decrease the bias and/or over-/under-fitting I employ the cross-validation by splitting the provided training data set into sub-sets of training and test subs. Taking into account the input, it would make sense to split data into contiguous time blocks, using e.g. `createTimeSlices`, if the performance was acceptable. Thus, for this project I skip the time-awareness and employ the simple k-fold CV of 3. 
+
+```{r}
+ctrl <- trainControl(method = "cv", 
+                     number = 3, 
+                     savePredictions = "final",
+                     allowParallel = TRUE
+)
+
+# use all variables as predictors
+base_formula <- classe ~ .
+```
+
+## Note on Data Impute
+I removed only the columns with almost all NAs, but there are still NA values present for a few observations. To increase coverage, I fill the missing data the median value, refer to the `medianImpute` pre-processing. The `caret` will fit the imputer on each training slice only and apply it to the corresponding validation slice.
+
+# Building the models
+
+## Initial models
+
+### Random Forest
+```{r}
+fit_rf <- train(
+  base_formula, 
+  data = df,
+  method     = "ranger",
+  trControl  = ctrl,
+  preProcess = "medianImpute",
+  num.trees  = 50,
+  importance = "impurity"
+)
+
+plot(fit_rf, metric = "Accuracy")   # caret plots Accuracy vs mtry
+```
+
+### Gradient Boosting
+```{r}
+fit_gbm <- train(
+  base_formula, 
+  data = df,
+  method     = "gbm",
+  trControl  = ctrl,
+  preProcess = "medianImpute",
+  tuneLength = 2,
+  verbose    = FALSE
+)
+plot(fit_gbm, metric = "Accuracy")  # shows performance across n.trees
+```
+
+### Decision Tree
+```{r}
+fit_cart <- train(
+  base_formula, 
+  data = df,
+  method     = "rpart",
+  trControl  = ctrl,
+  preProcess = "medianImpute",
+  tuneGrid   = data.frame(cp = 0.01)
+)
+fancyRpartPlot(fit_cart$finalModel)
+```
+
+## Expected Sample Error and Choosing the winner
+```{r}
+fit_info_rf <- subset(
+  fit_rf$pred,
+  mtry == fit_rf$bestTune$mtry &
+    splitrule == fit_rf$bestTune$splitrule &
+    min.node.size == fit_rf$bestTune$min.node.size
+)
+
+fit_info_gbm <- subset(
+  fit_gbm$pred,
+  n.trees == fit_gbm$bestTune$n.trees &
+    interaction.depth == fit_gbm$bestTune$interaction.depth &
+    shrinkage == fit_gbm$bestTune$shrinkage &
+    n.minobsinnode == fit_gbm$bestTune$n.minobsinnode
+)
+
+fit_info_cart <- subset(
+  fit_cart$pred,
+  cp == fit_cart$bestTune$cp
+)
+
+format_accuracy_row <- function(name, p) {
+  n <- nrow(p); correct <- sum(p$pred == p$obs, na.rm = TRUE)
+  acc <- correct / n
+  ci  <- binom.test(correct, n)$conf.int
+  data.frame(
+    Model            = name,
+    Accuracy         = sprintf("%.2f%%", 100 * acc),
+    `Accuracy 95%% CI` = sprintf("%.2f–%.2f%%", 100 * ci[1], 100 * ci[2]),
+    `Expected error` = sprintf("%.2f%%", 100 * (1 - acc)),
+    `Error 95%% CI`  = sprintf("%.2f–%.2f%%", 100 * (1 - ci[2]), 100 * (1 - ci[1])),
+    N = n,
+    check.names = FALSE
+  )
+}
+
+accuracy_table <- rbind(
+  format_accuracy_row("RF",   fit_info_rf),
+  format_accuracy_row("GBM",  fit_info_gbm),
+  format_accuracy_row("CART", fit_info_cart)
+)
+
+print(accuracy_table, row.names = FALSE)
+```
+The best accuracy is 99.46% for the Random Forest (Ranger) model.
+```{r}
+plot(varImp(fit_rf), top = 15)
+```
+
+
+# Predicting on the Test Dataset
+## Final Model
+Let's first re-train the model to use the `bestTune` of Random Forest model.
+```{r}
+final_rf <- train(
+  base_formula,
+  data      = df,
+  method    = "ranger",
+  trControl = trainControl(method = "none"),
+  tuneGrid  = fit_rf$bestTune,
+  preProcess = "medianImpute",   
+  num.trees = 300
+)
+```
+## Prediction
+Using the refitted model, we can predict the `classe` for the test data:
+```{r}
+predict(final_rf, newdata = testing_df)
+```
